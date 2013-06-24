@@ -1,0 +1,450 @@
+	
+
+    -- master API by PonyKuu
+    -- Version 0.2a
+     
+    -- A little change to standard assert function
+    _G.assert = function(condition, errMsg, level)
+      if not condition then
+            error(errMsg, (tonumber(level) or 1) + 1)
+      end
+      return condition
+    end
+     
+    --[[
+    *********************************************************************************************
+    *                                    Communication Part                                     *
+    *********************************************************************************************
+    ]]--
+     
+    -- MasterID is the unique identifier of master. Default is 100
+    local MasterID = 100
+    -- Channel is the channel Master listens.
+    local channel
+    -- A modem.
+    local modem = peripheral.wrap ("right")
+     
+    -- The first function is used to parse a message received on modem
+    -- It determines whether the message is valid or not
+    -- Message should be a table with fields
+    --  1) Protocol - must be equal to "KuuNet"
+    --  2) ID - that's a sender ID
+    --  3) Master - that must be equal to MasterID variable.
+    --  4) Type - the type of the module. Used to know how to handle its task requests
+    --  Some other fields
+    local function isValid (message)
+            return  message ~= nil and
+                            type(message) == "table" and
+                            message.Protocol == "KuuNet" and
+                            message.ID ~= nil and
+                            message.Master == MasterID
+    end
+     
+    -- The function that listens for a valid message and returns it
+    function listen ()
+            local msg
+            while not isValid(msg) do
+                    local _, _, _, _, text_message = os.pullEvent("modem_message")
+                    msg = textutils.unserialize (text_message)
+            end
+            return msg
+    end
+     
+    -- And a function to send a response
+    function response (ID, chan, message)
+            assert (type(ID) == "number", "Bad module ID: Number required, got "..type(ID), 2)
+            assert (type(chan) == "number", "Bad channel: Number required, got "..type(chan), 2)
+            assert (type(message) == "table", "Bad message: Table required, got "..type(message), 2)
+            message.Protocol = "KuuNet"
+            message.ID = ID
+            message.Master = MasterID
+            modem.transmit (chan+1, chan, textutils.serialize(message))
+    end
+     
+     
+    --[[
+    *********************************************************************************************
+    *                                   Module Placement Part                                   *
+    *********************************************************************************************
+    ]]--
+    -- moduleCount is the number of active modules
+    -- needModules is the number of modules required
+    local moduleCount = 0
+    local needModules = 0
+     
+    -- Equipment is a table that contains information about slots with chests and turtles.
+    -- Fuel is the fuel chest, Stuff is the stuff chest and Turtle is the wireless mining turtle.
+    -- If Stuff or Fuel is nil, it is not used, otherwize it is the slot where it lies.
+    -- Make sure that if Master sucks items from Module and then breaks it, the equipment table will still be correct.
+    local equipment = {Fuel = 1, Stuff = 2, Turtle = 3}
+    function setEquipment (newEquipment)
+            assert (type(newEquipment)=="table", "Bad equipment configuration: Table required.", 2)
+            assert (newEquipment.Turtle, "\"Turtle\" field is required in equipment configuration", 2)
+            for k, v in pairs(newEquipment) do
+                    assert (type(v) == "number" and v > 0 and v < 17, "Bad equipment field "..k.." : Not a slot number", 2)
+            end
+            equipment = newEquipment
+    end
+     
+    -- Function to place a new module
+    local function addModule ()
+            turtle.select (equipment.Turtle)
+            -- put it down
+            if turtle.place () then
+                    -- Add a fuel chest if it is set
+                    if equipment.Fuel ~= nil then
+                            turtle.select (equipment.Fuel)
+                            turtle.drop (1)
+                    end
+                    -- And a stuff chest
+                    if equipment.Stuff ~= nil then
+                            turtle.select (equipment.Stuff)
+                            turtle.drop (1)
+                    end
+                    -- select the first slot to make things look good :)
+                    turtle.select (1)
+                    -- Turn on the module
+                    peripheral.call ("front", "turnOn")
+            end
+    end
+     
+     
+    --[[
+    *********************************************************************************************
+    *                                       Operation Part                                      *
+    *********************************************************************************************
+    ]]--
+     
+    -- tStates is a table that contains all the states of the modules.
+    -- Indexes of that table are ID's and values are tables with following fields
+    --  1) Type - type of the module. Each Type has it's own task table
+    --  2) State - the state of the module. List of states is unique for each module type, but there are some common states: "Waiting" and "Returning"
+    tStates = {}
+     
+    -- There is a function that searches for a free ID. Let's limit the maximun number of IDs to 1024
+    local function freeID ()
+            for i = 1, 64 do
+                    if tStates [i] == nil then
+                            return i
+                    end
+            end
+    end
+     
+    -- Tasks table. I'll explain it a bit later
+    tTasks = {}
+     
+    -- Here is the table used to handle the requests.
+    tRequests = {
+            -- "Master" is the request sent by new modules. We should assign a new ID to it and remember that ID in tStates table
+            Master = function (request)
+                    local ID = freeID ()
+                    response (request.ID, channel, {NewID = ID})
+                    tStates[ID] = {State = "Waiting", Type = request.Type}
+                    moduleCount = moduleCount + 1
+            end,
+            -- Task is the request used to reques the next thing module should do
+            -- It uses the tTasks table. There is a function for each module type which returns a response
+            -- Response may contain coordinate of the next place and id should contain "Task" field
+            -- This function may do something else, change the state of module and so on.
+            -- To associate it with the module, sender ID is passed to that function
+            -- tTasks table should be filled by user of this API
+            Task = function (request)
+                    response (request.ID, channel, tTasks[request.Type](request.ID))
+            end,
+            -- "Returned" is the request sent by module that has returned to Master and waiting there until Master collects it
+            Returned = function (request)
+                    while turtle.suck () do end -- Get all the items that module had
+                    turtle.dig ()               -- And get the module back
+                    tStates[request.ID] = nil -- delete that module from our state table
+                    moduleCount = moduleCount - 1 -- and decrease the counter
+            end
+    }
+     
+    -- This is the variable used to determine whether the master should place modules
+    local isPlacing = false
+     
+    -- This is the function used to place modules if there are any available
+    -- It automatically stops placing modules when there is enough modules
+    local function moduleManager ()
+            -- A function which checks each slot from the Equipment table and returns is there at least one item in each slot
+            local function freeEquipment ()
+                    for key, value in pairs(equipment) do
+                            if turtle.getItemCount (value) == 0 then
+                                    return false
+                            end
+                    end
+                    return true
+            end
+            while true do
+                    if isPlacing then
+                            if moduleCount == needModules or not freeEquipment () then
+                                    isPlacing = false
+                            else
+                                    addModule ()
+                            end
+                    end
+                    sleep (6)
+            end
+    end
+     
+    -- The main operation function
+    -- stateFunction is the function used to determine when master should stop.
+    -- Master stops when there are no active modules and stateFunction returns false.
+    -- State function can do other things, such as reinitialization to a new module script and so on, but it shouldn't take too much time to execute
+    function operate (stateFunction)
+            assert (type(stateFunction) == "function", "Bad state function: Function required, got "..type(stateFunction), 2)
+            local server = function ()
+                    -- run is used to determine whether master should run.
+                    local run = stateFunction ()
+                    while run or moduleCount > 0 do
+                            -- check our state function
+                            run = stateFunction()
+                            -- If state function returns false, then stop placing modules
+                            if isPlacing and not run then
+                                    isPlacing = false
+                            end
+                            local request = listen ()
+                            tRequests[request.Request](request) -- Just execute the request handler.
+                    end
+            end
+            parallel.waitForAny (server, moduleManager)
+            modem.closeAll ()
+    end
+     
+    --[[
+    *********************************************************************************************
+    *                                    Initialization Part                                    *
+    *********************************************************************************************
+    ]]--
+     -- Position is just the position of the Master.
+    local Position = {x = 0, y = 0, z = 0, f = 0}
+    -- New placed modules will request "Position" to know where they are.
+    local modPosition = {x = 1, y = 0, z = 0, f = 0}
+     
+    -- naviData is used by modules to navigate and not interlock themselves
+    -- by default they use highway navigation method, which requires prameters x, z and height
+    local naviData = {x = 0, z = 0, height = 0}
+     
+    function setNavigation (newNaviData)
+            assert (type(newNaviData) == "table", "Bad navigation data: Table required.", 2)
+        naviData = newNaviData
+    end
+     
+    -- Some basic movement and refueling
+    -- Refuel temporary uses 16 slot to get the fuel out of fuel chest
+    local function refuel (amount)
+            local fuel =  turtle.getFuelLevel ()
+            if fuel == "unlimited" or fuel > amount then
+                    return true
+            else
+                    assert (equipment.Fuel, "Fuel chest is not set while fuel is finite.", 2)
+                    turtle.select (equipment.Fuel)
+                    turtle.placeUp ()
+                    turtle.select (16)
+                    turtle.suckUp ()
+                    while true do
+                            if not turtle.refuel (1) then
+                                    turtle.suckUp ()
+                            end
+                            if turtle.getFuelLevel() >= amount then
+                                    turtle.dropUp ()
+                                    turtle.select (equipment.Fuel)
+                                    turtle.digUp ()
+                                    return true
+                            end
+                    end
+            end
+    end
+     
+    local tMoves = {
+            forward = turtle.forward,
+            back = turtle.back
+    }
+    local function forceMove (direction)
+            refuel (1)
+            while not tMoves[direction]() do
+                    print "Movement obstructed. Waiting"
+                    sleep (1)
+            end
+    end
+     
+    -- The function to set the "task" function for the said module type
+    function setType (Type, taskFunction)
+            assert (type(Type) == "string", "Bad module type: String required, got "..type(Type), 2)
+            assert (type(taskFunction) == "function", "Bad task function: Function required, got "..type(taskFunction), 2)
+            tTasks[Type] = taskFunction
+    end
+     
+     
+    -- This function is used to make all the files required by module to run.
+    -- Scriptname is the name of the main module script
+    local function prepareFiles (scriptname)
+            -- Copy all the required files on the disk
+            if fs.exists ("/disk/module") then
+                    fs.delete ("/disk/module")
+            end
+            fs.copy ("module", "/disk/module")
+            if fs.exists ("/disk/"..scriptname) then
+                    fs.delete ("/disk/"..scriptname)
+            end
+            fs.copy (scriptname, "/disk/"..scriptname)
+            -- Make a startup file for modules
+            local file = fs.open ("/disk/startup", "w")
+            file.writeLine ("shell.run(\"copy\", \"/disk/module\", \"/module\")")
+            file.writeLine ("shell.run(\"copy\", \"/disk/"..scriptname.."\", \""..scriptname.."\")")
+            file.writeLine ("shell.run(\""..scriptname.."\")")
+            file.close()
+       
+            -- Now, make a file with all the data modules need
+            file = fs.open ("/disk/initdata", "w")
+            -- Communication data: master ID and communication channel
+            file.writeLine (textutils.serialize ({MasterID = MasterID, channel = channel}) )
+            -- Location data:
+            file.writeLine (textutils.serialize (modPosition))
+            -- Navigation data:
+            file.writeLine (textutils.serialize (naviData))
+            file.close()
+    end
+     
+    -- The initialization function of the master.
+    -- Filename is the name of module's script. It will be copied on the disk drive
+    function init (filename, ID, mainChannel, moduleCount)
+            assert (fs.exists(filename), "Module script \""..filename.."\" does not exist.", 2)
+            assert (fs.exists("module"), "Module API is required.", 2)
+            assert (type(ID) == "string" or type(ID) == "number" , "Bad Master ID: String or number required, got "..type(ID), 2)
+            assert (type(mainChannel) == "number", "Bad channel: Number required, got "..type(mainChannel), 2)
+            assert (type(moduleCount) == "number" and moduleCount > 0, "Bad module count: Positive number required.", 2)
+           
+            -- Set the ID of the Master
+            MasterID = ID
+            -- Set the main channel
+            channel = mainChannel
+     
+            -- Next, we need to know the position of the master.
+            -- If gps is not found, use relative coordinates
+            modem.open(gps.CHANNEL_GPS)
+            local gpsPresent = true
+            local x, y, z = gps.locate(5)
+            if x == nil then
+                    x, y, z = 0, 0, 0
+                    print "No gps found. Using relative coordinates."
+                    gpsPresent = false
+            end
+       
+            -- Now we need to move forward to copy files on disk and determine our f
+            forceMove ("forward")
+            local newX, newZ = 1, 0 -- if there is no gps, assume that master is facing positive x
+            if gpsPresent then
+                    newX, __, newZ = gps.locate (5)
+            end
+            if channel ~= gps.CHANNEL_GPS then
+                    modem.close(gps.CHANNEL_GPS)
+            end
+            -- Determine f by the difference of coordinates.
+            local xDiff = newX - x
+            local zDiff = newZ - z
+            if xDiff ~= 0 then
+                    if xDiff > 0 then
+                            f = 0     -- Positive x
+                    else
+                            f = 2     -- Negative x
+                    end
+            else
+                    if zDiff > 0 then
+                            f = 1     -- Positive z
+                    else
+                            f = 3     -- Negative z
+                    end
+            end
+            -- And set the position and modPosition variables.
+            Position = {x = x, y = y, z = z, f = f}
+            modPosition = {x = newX, y = y, z = newZ, f = f}
+       
+            -- Make all the file required
+            prepareFiles (filename)
+            -- And go back to initial location
+            forceMove ("back")
+       
+            -- Set the amount of modules needed. I use "+" because one can run init again to add a different type of module to the operation
+            needModules = needModules + moduleCount
+            -- Open the channel to listen for requests
+            modem.open (channel)
+            -- And start placing modules
+            isPlacing = true
+    end
+     
+    --[[
+    *********************************************************************************************
+    *                                       Utility Part                                        *
+    *********************************************************************************************
+    ]]--
+     
+    -- This is just a return response added for convinience, because every task function should return the module eventually.
+    function makeReturnTask ()
+            -- return position is two block away from Master. So, let's calculate it.
+            local tShifts = {
+                    [0] = { 1,  0},
+                    [1] = { 0,  1},
+                    [2] = {-1,  0},
+                    [3] = { 0, -1},
+            }
+            local xShift, zShift = unpack (tShifts[modPosition.f])
+            returnX = modPosition.x + xShift
+            returnZ = modPosition.z + zShift
+            return {   Task = "Return",
+                    x = returnX,
+                    y = modPosition.y,
+                    z = returnZ,
+                    f = (modPosition.f+2)%4, -- basically, reverse direction
+            }
+    end
+     
+    -- And a function to make any other task
+    -- additionalData is optional.
+    function makeTask (taskName, coordinates, additionalData)
+            assert (type(taskName) == "string", "Bad task name: String required, got "..type(taskName), 2)
+            assert (type(coordinates) == "table", "Bad coordinates: Table required, got "..type(coordinates), 2)
+            local tCoordinates = {"x", "y", "z", "f"}
+            -- Check if the coordinates are actually numbers
+            for index, value in ipairs(tCoordinates) do
+                    assert (type(coordinates[value]) == "number", "Bad "..value.." coordinate: Number required, got"..type(coordinates[value]), 2)
+            end
+           
+            local newTask = {Task = taskName}
+            for key, value in pairs (coordinates) do  
+                    newTask[key] = value
+            end
+            if type(additionalData) == "table" then
+                    for key, value in pairs (additionalData) do  
+                            newTask[key] = value
+                    end
+            end
+            return newTask
+    end
+     
+    -- These functions are used to get or set the state of the module with specified ID
+    function getState (ID)
+            return tStates[ID].State
+    end
+    function setState (ID, newState)
+            assert (tStates[ID], "No module with such ID: "..ID, 2)
+            assert (type(newState) == "string", "Bad task name: String required, got "..type(newState), 2)
+            tStates[ID].State = newState
+    end
+     
+    -- reinit function is just a simplified init, that doesn't update channel, MasterID and Master's position. Use it to change the modules script
+    function reinit (filename, moduleCount)
+            assert (fs.exists(filename), "Module script \""..filename.."\" does not exist.", 2)
+            assert (type(moduleCount) == "number" and moduleCount > 0, "Bad module count: Positive number required.", 2)
+            -- Prepare the files on disk
+            forceMove ("forward")
+            prepareFiles (filename)
+            forceMove ("back")
+        -- Set the amount of modules needed.
+            needModules = needModules + moduleCount
+            -- Open the channel to listen for requests
+            modem.open (channel)
+            -- And start placing modules
+            isPlacing = true
+    end
+
